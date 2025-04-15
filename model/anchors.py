@@ -33,14 +33,3 @@ def generate_anchors(feature_size, stride, scales, ratios, device="cpu"):
 
     anchors = (base_anchors[None, :, :] + shifts[:, None, :]).reshape(-1, 4)
     return anchors  # [H * W * A, 4]
-
-
-if __name__ == "__main__":
-    anchors = generate_anchors(
-        feature_size=(14, 14),
-        stride=16,
-        scales=[8, 16, 32],
-        ratios=[0.5, 1.0, 2.0],
-        device="cpu"
-    )
-    print("Anchor shape:", anchors.shape)  # [14×14×9, 4] = [1764, 4]

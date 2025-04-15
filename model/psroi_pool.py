@@ -25,5 +25,6 @@ def psroi_pooling(features, rois, output_size, spatial_scale, num_classes, group
     pooled = pooled.view(rois.shape[0], num_classes, k, k, output_size[0], output_size[1])
 
     # Вибираємо по діагоналі [i-th region → i-th PS map] → середнє значення
-    output = pooled.mean(dim=[3, 4, 5])  # [N, num_classes]
-    return output
+    #output = pooled.mean(dim=[3, 4, 5])  # [N, num_classes]
+    pooled = pooled.mean(dim=[2, 3])  # Середнє по k x k
+    return pooled

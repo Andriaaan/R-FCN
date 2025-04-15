@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from model.backbone import build_backbone
+from model.postprocess import postprocess_proposals
 from model.psroi_pool import psroi_pooling
 from model.rpn import RPN
 from model.anchors import generate_anchors
@@ -19,7 +20,7 @@ class RFCN(nn.Module):
         self.backbone, out_channels = build_backbone(backbone_name, pretrained)
 
         # RPN
-        self.rpn = RPN(in_channels=out_channels, n_anchors=n_anchors)
+        self.rpn_head = RPN(in_channels=out_channels, n_anchors=n_anchors)
 
         self.anchor_stride = 16
         self.anchor_ratios = [0.5, 1.0, 2.0]
@@ -33,16 +34,16 @@ class RFCN(nn.Module):
         self.k = 3
 
         # TODO: Classification + bbox heads
-        self.cls_head = nn.Conv2d(256, num_classes * self.k * self.k, kernel_size=1)
+        self.cls_head = nn.Conv2d(2048, num_classes * self.k * self.k, kernel_size=1)
         self.bbox_head = None
 
     def forward(self, images, targets=None):
         B, _, H, W = images.shape
 
-        # 1. Backbone → Features
-        features = self.backbone(images)  # [B, C, H', W']
+        # --- Backbone ---
+        features = self.backbone(images)
 
-        # 2. RPN → objectness + bbox_deltas
+        # --- RPN ---
         objectness, bbox_deltas = self.rpn_head(features)
 
         # 3. Generate anchors (на одне зображення — однакові)
@@ -73,7 +74,7 @@ class RFCN(nn.Module):
         for i, props in enumerate(proposals):
             batch_idx = torch.full((props.shape[0], 1), i, dtype=torch.float32, device=props.device)
             rois.append(torch.cat([batch_idx, props], dim=1))
-        rois = torch.cat(rois, dim=0)
+        rois = torch.cat(rois, dim=0)  # [N, 5] (batch_idx, x1, y1, x2, y2)
 
         # --- Класифікаційна фічмапа ---
         cls_maps = self.cls_head(features)  # [B, C, H', W']
@@ -88,11 +89,20 @@ class RFCN(nn.Module):
             group_size=self.k
         )  # [N, num_classes]
 
-        if self.training and targets is not None:
-            matched_labels = match_rois_to_gt(rois, targets)
-            loss_cls = F.cross_entropy(scores, matched_labels)
-            return loss_cls
+        scores = scores.mean(dim=[2, 3])  # [N, num_classes]
 
-        # --- Інференс ---
-        probs = F.softmax(scores, dim=1)
-        return proposals, probs
+        # --- Match RoIs to GT (для тренування) --- Squeeze extra dimensions (e.g., from [N, C, 1, 1] to [N, C])
+        #scores = scores.squeeze(-1).squeeze(-1)  # [N, num_classes]
+        #print(scores.shape)
+
+        # --- Постобробка (для інференсу) ---
+        filtered_boxes, filtered_scores, filtered_labels = postprocess_proposals(
+            proposals=rois[:, 1:],  # [N, 4] — координати боксів
+            scores=scores,
+            score_thresh=0.05,
+            nms_thresh=0.5,
+            max_dets=100
+        )
+
+        # --- Повертаємо результати ---
+        return filtered_boxes, filtered_scores, filtered_labels
