@@ -9,6 +9,25 @@ from model.proposals import generate_proposals
 from model.matcher import match_rois_to_gt
 
 
+class BBoxHead(nn.Module):
+    def __init__(self, in_channels, num_classes, k=7):
+        """
+        Вхід: фічемапа з розмірністю in_channels.
+        Вихід: тензор розміру [B, num_classes*4*k*k, H, W],
+               який буде подаватися в PSRoI Pooling.
+        """
+        super(BBoxHead, self).__init__()
+        self.k = k
+        self.num_classes = num_classes
+        # Тут вихідний канал = num_classes * 4 * k * k,
+        # оскільки для кожного класу потрібно 4 регресійні значення і кожен регіон має k x k позиційно чутливих блоків.
+        self.conv = nn.Conv2d(in_channels, num_classes * 4 * k * k, kernel_size=1)
+
+    def forward(self, x):
+        # x має форму [B, in_channels, H, W]
+        # Результат: [B, num_classes*4*k*k, H, W]
+        return self.conv(x)
+
 class RFCN(nn.Module):
     def __init__(self, num_classes, backbone_name='resnet50', pretrained=True, n_classes=21, n_anchors=9):
         """
@@ -26,16 +45,14 @@ class RFCN(nn.Module):
         self.anchor_ratios = [0.5, 1.0, 2.0]
         self.anchor_scales = [8, 16, 32]
 
-        # TODO: PSRoI pooling
-        self.psroi_pool = None  # Поки заглушка
+        self.psroi_pool = psroi_pooling
 
         self.num_classes = num_classes
 
-        self.k = 3
+        self.k = 7  # Розмір PSRoI pooling (k x k)
 
-        # TODO: Classification + bbox heads
         self.cls_head = nn.Conv2d(2048, num_classes * self.k * self.k, kernel_size=1)
-        self.bbox_head = None
+        self.bbox_head = BBoxHead(in_channels=out_channels, num_classes=num_classes, k=self.k)
 
     def forward(self, images, targets=None):
         B, _, H, W = images.shape
@@ -44,10 +61,10 @@ class RFCN(nn.Module):
         features = self.backbone(images)
 
         # --- RPN ---
-        objectness, bbox_deltas = self.rpn_head(features)
+        objectness, bbox_deltas_rpn = self.rpn_head(features)
 
-        # 3. Generate anchors (на одне зображення — однакові)
-        feat_size = features.shape[-2:]  # (H', W')
+        # Generate anchors
+        feat_size = features.shape[-2:]
         device = images.device
         anchors = generate_anchors(
             feature_size=feat_size,
@@ -57,10 +74,10 @@ class RFCN(nn.Module):
             device=device
         )
 
-        # 4. Generate proposals (list of B tensors)
+        # Generate proposals
         proposals = generate_proposals(
             objectness=objectness,
-            bbox_deltas=bbox_deltas,
+            bbox_deltas=bbox_deltas_rpn,
             anchors=anchors,
             image_size=(H, W),
             pre_nms_top_n=6000,
@@ -69,40 +86,49 @@ class RFCN(nn.Module):
             min_size=16,
         )
 
-        # --- Підготовка RoIs ---
+        # Підготовка RoIs
         rois = []
         for i, props in enumerate(proposals):
             batch_idx = torch.full((props.shape[0], 1), i, dtype=torch.float32, device=props.device)
             rois.append(torch.cat([batch_idx, props], dim=1))
-        rois = torch.cat(rois, dim=0)  # [N, 5] (batch_idx, x1, y1, x2, y2)
+        rois = torch.cat(rois, dim=0)  # [N, 5]
 
-        # --- Класифікаційна фічмапа ---
+        # Класифікаційна карта
         cls_maps = self.cls_head(features)  # [B, C, H', W']
 
-        # --- PSRoI Pooling ---
-        scores = psroi_pooling(
+        # --- Класифікаційна гілка ---
+        cls_maps = self.cls_head(features)  # [B, num_classes*k*k, H', W']
+        cls_scores = psroi_pooling(
             features=cls_maps,
             rois=rois,
             output_size=(self.k, self.k),
             spatial_scale=1.0 / self.anchor_stride,
             num_classes=self.num_classes,
             group_size=self.k
-        )  # [N, num_classes]
+        )  # [N, num_classes, k, k]
+        cls_scores = cls_scores.mean(dim=[2, 3])  # [N, num_classes]
 
-        scores = scores.mean(dim=[2, 3])  # [N, num_classes]
+        # --- Регістрійна гілка ---
+        bbox_maps = self.bbox_head(features)  # [B, num_classes*4*k*k, H', W']
+        bbox_deltas = psroi_pooling(
+            features=bbox_maps,
+            rois=rois,
+            output_size=(self.k, self.k),
+            spatial_scale=1.0 / self.anchor_stride,
+            num_classes=self.num_classes * 4,  # тут 4 значення на клас
+            group_size=self.k
+        )  # [N, num_classes*4, k, k]
+        bbox_deltas = bbox_deltas.mean(dim=[2, 3])  # [N, num_classes*4]
 
-        # --- Match RoIs to GT (для тренування) --- Squeeze extra dimensions (e.g., from [N, C, 1, 1] to [N, C])
-        #scores = scores.squeeze(-1).squeeze(-1)  # [N, num_classes]
-        #print(scores.shape)
-
-        # --- Постобробка (для інференсу) ---
-        filtered_boxes, filtered_scores, filtered_labels = postprocess_proposals(
-            proposals=rois[:, 1:],  # [N, 4] — координати боксів
-            scores=scores,
-            score_thresh=0.05,
-            nms_thresh=0.5,
-            max_dets=100
-        )
-
-        # --- Повертаємо результати ---
-        return filtered_boxes, filtered_scores, filtered_labels
+        if self.training or targets is not None:
+            return cls_scores, bbox_deltas, rois, targets
+        else:
+            # Постобробка
+            filtered_boxes, filtered_scores, filtered_labels = postprocess_proposals(
+                proposals=rois[:, 1:],  # координати боксів
+                scores=cls_scores,
+                score_thresh=0.05,
+                nms_thresh=0.5,
+                max_dets=100
+            )
+            return filtered_boxes, filtered_scores, filtered_labels

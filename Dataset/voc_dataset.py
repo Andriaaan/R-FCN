@@ -44,6 +44,7 @@ class VOCDataset(Dataset):
 
         if self.transforms:
             img, target = self.transforms(img, target)
+            #img = self.transforms(img)
 
         return img, target
 

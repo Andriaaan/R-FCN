@@ -58,7 +58,12 @@ def train_one_epoch(model, loader, optimizer, device):
 
         # Classification loss
         cls_labels = torch.cat([t['labels'] for t in targets]).to(device)
-        cls_loss = cls_criterion(scores, cls_labels)  # scores shape: [N, 21]
+        print("scores shape:", scores.shape)
+        print("cls_labels shape:", cls_labels.shape)
+        if scores.ndim == 1:
+            scores = scores.view(-1, 21)
+
+        cls_loss = cls_criterion(scores, cls_labels)
 
         # Bounding box regression loss
         bbox_targets = torch.cat([t['boxes'] for t in targets]).to(device)

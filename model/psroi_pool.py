@@ -17,9 +17,13 @@ def psroi_pooling(features, rois, output_size, spatial_scale, num_classes, group
         scores: [N, num_classes] — логіти класів
     """
     k = group_size
+    if len(features.size()) != 4:
+        raise ValueError(f"Expected features to have 4 dimensions (B, C, H, W), but got {features.size()}")
     N, C, H, W = features.shape
     assert C == num_classes * k * k, f"Feature map channels ({C}) ≠ num_classes × k²"
 
+    if len(rois.size()) != 2 or rois.size(1) != 5:
+        raise ValueError(f"Expected rois to have shape [N, 5], but got {rois.size()}")
     # PS: розділимо features → [num_classes, k, k]
     pooled = roi_align(features, rois, output_size=output_size, spatial_scale=spatial_scale, aligned=True)
     pooled = pooled.view(rois.shape[0], num_classes, k, k, output_size[0], output_size[1])
